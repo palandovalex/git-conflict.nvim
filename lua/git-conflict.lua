@@ -503,7 +503,13 @@ local function process(bufnr, range_start, range_end)
     if name ~= '' then visited_buffers[name] = nil end
     return
   end
-  
+
+  if not visited_buffers[bufnr] then
+    local name = api.nvim_buf_get_name(bufnr)
+    if name == '' then return end
+    visited_buffers[name] = visited_buffers[name] or { positions = {} }
+  end
+
   if visited_buffers[bufnr] and visited_buffers[bufnr].tick == vim.b[bufnr].changedtick then
     return
   end
@@ -695,6 +701,16 @@ function M.setup(user_config)
       if config.default_mappings then clear_buffer_mappings(bufnr) end
     end,
   })
+
+  if type(config.cond) == 'function' then
+    api.nvim_create_autocmd('TabEnter', {
+      group = AUGROUP_NAME,
+      callback = function()
+        local bufnr = api.nvim_get_current_buf()
+        if utils.is_valid_buf(bufnr) then process(bufnr) end
+      end,
+    })
+  end
 
   api.nvim_set_decoration_provider(NAMESPACE, {
     on_buf = function(_, bufnr, _) return utils.is_valid_buf(bufnr) end,
