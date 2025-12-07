@@ -73,6 +73,7 @@ local job = utils.job
 --- @field list_opener string|function
 --- @field highlights ConflictHighlights
 --- @field debug boolean
+--- @field cond boolean|fun(bufnr: integer):boolean
 
 --- @class GitConflictUserConfig
 --- @field default_mappings? boolean|GitConflictMappings
@@ -81,6 +82,7 @@ local job = utils.job
 --- @field list_opener? string|function
 --- @field highlights? ConflictHighlights
 --- @field debug? boolean
+--- @field cond boolean|fun(bufnr: integer):boolean
 
 -----------------------------------------------------------------------------//
 -- Constants
@@ -147,6 +149,7 @@ local config = {
     incoming = 'DiffAdd',
     ancestor = nil,
   },
+  cond = true,
 }
 
 --- @return table<string, ConflictBufferCache>
@@ -166,6 +169,23 @@ local state = {
   ---@type string?
   current_watcher_dir = nil,
 }
+
+local function is_enabled(bufnr)
+  local cond = config.cond
+  if cond == nil then return true end
+  if type(cond) == 'boolean' then return cond end
+  if type(cond) == 'function' then
+    bufnr = bufnr or api.nvim_get_current_buf()
+    local ok, result = pcall(cond, bufnr)
+    if not ok then
+      if config.debug then utils.notify(tostring(result), 'error') end
+      return false
+    end
+    return not not result
+  end
+  return true
+end
+local clear_buffer_mappings
 
 -----------------------------------------------------------------------------//
 
@@ -394,7 +414,7 @@ end
 local function parse_buffer(bufnr, range_start, range_end)
   local lines = utils.get_buf_lines(range_start or 0, range_end or -1, bufnr)
   local prev_conflicts = visited_buffers[bufnr].positions ~= nil
-      and #visited_buffers[bufnr].positions > 0
+    and #visited_buffers[bufnr].positions > 0
   local has_conflict, positions = detect_conflicts(lines)
 
   update_visited_buffers(bufnr, positions)
@@ -475,6 +495,21 @@ local throttled_watcher = utils.throttle(1000, watch_gitdir)
 ---@param bufnr integer?
 local function process(bufnr, range_start, range_end)
   bufnr = bufnr or api.nvim_get_current_buf()
+
+  if not is_enabled(bufnr) then
+    M.clear(bufnr)
+    clear_buffer_mappings(bufnr)
+    local name = api.nvim_buf_get_name(bufnr)
+    if name ~= '' then visited_buffers[name] = nil end
+    return
+  end
+
+  if not visited_buffers[bufnr] then
+    local name = api.nvim_buf_get_name(bufnr)
+    if name == '' then return end
+    visited_buffers[name] = visited_buffers[name] or { positions = {} }
+  end
+
   if visited_buffers[bufnr] and visited_buffers[bufnr].tick == vim.b[bufnr].changedtick then
     return
   end
@@ -566,7 +601,7 @@ end
 ---@return boolean
 local function is_mapped(key, mode) return fn.hasmapto(key, mode or 'n') > 0 end
 
-local function clear_buffer_mappings(bufnr)
+clear_buffer_mappings = function(bufnr)
   if not bufnr or not vim.b[bufnr].conflict_mappings_set then return end
   for _, mapping in pairs(config.default_mappings) do
     if is_mapped(mapping) then api.nvim_buf_del_keymap(bufnr, 'n', mapping) end
@@ -667,6 +702,16 @@ function M.setup(user_config)
     end,
   })
 
+  if type(config.cond) == 'function' then
+    api.nvim_create_autocmd('TabEnter', {
+      group = AUGROUP_NAME,
+      callback = function()
+        local bufnr = api.nvim_get_current_buf()
+        if utils.is_valid_buf(bufnr) then process(bufnr) end
+      end,
+    })
+  end
+
   api.nvim_set_decoration_provider(NAMESPACE, {
     on_buf = function(_, bufnr, _) return utils.is_valid_buf(bufnr) end,
     on_win = function(_, _, bufnr, _, _)
@@ -685,8 +730,8 @@ local function quickfix_items_from_positions(item, items, visited_buf)
   for _, pos in ipairs(visited_buf.positions) do
     for key, value in pairs(pos) do
       if
-          vim.tbl_contains({ name_map.ours, name_map.theirs, name_map.base }, key)
-          and not vim.tbl_isempty(value)
+        vim.tbl_contains({ name_map.ours, name_map.theirs, name_map.base }, key)
+        and not vim.tbl_isempty(value)
       then
         local lnum = value.range_start + 1
         local next_item = vim.deepcopy(item)
@@ -771,9 +816,9 @@ function M.choose(side)
           lines = utils.get_buf_lines(data.content_start, data.content_end + 1)
         elseif side == SIDES.BOTH then
           local first =
-              utils.get_buf_lines(position.current.content_start, position.current.content_end + 1)
+            utils.get_buf_lines(position.current.content_start, position.current.content_end + 1)
           local second =
-              utils.get_buf_lines(position.incoming.content_start, position.incoming.content_end + 1)
+            utils.get_buf_lines(position.incoming.content_start, position.incoming.content_end + 1)
           lines = vim.list_extend(first, second)
         elseif side == SIDES.NONE then
           lines = {}
@@ -790,7 +835,7 @@ function M.choose(side)
         if position.marks.ancestor.label then
           api.nvim_buf_del_extmark(0, NAMESPACE, position.marks.ancestor.label)
         end
-        parse_buffer(bufnr)
+        if is_enabled(bufnr) then parse_buffer(bufnr) end
         position = find_position(bufnr, function(line, pos)
           local left = pos.current.range_start >= start - 1
           local right = pos.incoming.range_end <= finish + 1
@@ -808,9 +853,9 @@ function M.choose(side)
     lines = utils.get_buf_lines(data.content_start, data.content_end + 1)
   elseif side == SIDES.BOTH then
     local first =
-        utils.get_buf_lines(position.current.content_start, position.current.content_end + 1)
+      utils.get_buf_lines(position.current.content_start, position.current.content_end + 1)
     local second =
-        utils.get_buf_lines(position.incoming.content_start, position.incoming.content_end + 1)
+      utils.get_buf_lines(position.incoming.content_start, position.incoming.content_end + 1)
     lines = vim.list_extend(first, second)
   elseif side == SIDES.NONE then
     lines = {}
@@ -827,7 +872,7 @@ function M.choose(side)
   if position.marks.ancestor.label then
     api.nvim_buf_del_extmark(0, NAMESPACE, position.marks.ancestor.label)
   end
-  parse_buffer(bufnr)
+  if is_enabled(bufnr) then parse_buffer(bufnr) end
 end
 
 function M.debug_watchers() vim.pretty_print({ watchers = watchers }) end
